@@ -4,6 +4,23 @@ A Proof of Concept (POC) demonstrating an event-driven payment service built wit
 
 The objective of this project is not to implement a production payment gateway, but to demonstrate important backend engineering concepts used in payment-oriented systems, including **REST APIs**, **event-driven architecture**, **Kafka producers and consumers**, **idempotency**, **JSON event serialization**, and **containerized local infrastructure**.
 
+**Repository:** https://github.com/i-am-thessa/thessacodes-java-payment-service.git
+
+## Changelogs
+
+The README describes the **current implementation**. Detailed implementation history, architectural evolution, and changes between POC versions are maintained in:
+
+- [CHANGELOG.md](CHANGELOG.md)
+
+Current implementation milestones:
+
+| Version | Milestone |
+|---|---|
+| `0.1.0` | Initial Kafka + Idempotency POC |
+| `0.2.0` | Service Layer + `@Transactional` + PostgreSQL |
+| `0.3.0` | Transactional Outbox Pattern |
+
+
 ---
 
 # High-Level Architecture
