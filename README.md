@@ -59,6 +59,8 @@ A Kafka consumer listens for the event and represents the downstream payment-pro
 - Spring Web MVC
 - Spring Validation
 - Spring Actuator
+- Spring Data JPA
+- Hibernate
 
 ### Messaging
 
@@ -67,6 +69,12 @@ A Kafka consumer listens for the event and represents the downstream payment-pro
 - Kafka Producer
 - Kafka Consumer
 - JSON event serialization/deserialization
+
+### Database
+
+- PostgreSQL
+- Spring Data JPA
+- Hibernate
 
 ### Development & Infrastructure
 
@@ -97,9 +105,11 @@ This project demonstrates how to:
 - Consume Kafka events using `@KafkaListener`.
 - Serialize and deserialize payment events as JSON.
 - Implement request idempotency using an `Idempotency-Key`.
+- Persist payments using Spring Data JPA and PostgreSQL.
+- Define a transaction boundary using Spring's `@Transactional`.
 - Use constructor-based dependency injection.
-- Separate API handling, event production, event consumption, and idempotency concerns.
-- Run Kafka locally using Docker Compose.
+- Separate API handling, business logic, persistence, event production, event consumption, and idempotency concerns.
+- Run Kafka and PostgreSQL locally using Docker Compose.
 - Configure Kafka producer and consumer behavior through Spring Boot properties.
 
 ---
@@ -119,7 +129,8 @@ The project was intentionally kept small so that each backend concept can be obs
 | ✅ Idempotency | Added an in-memory idempotency service using `ConcurrentHashMap`. |
 | ✅ Docker Kafka | Added Docker Compose configuration for a local Apache Kafka broker. |
 | ✅ JSON Messaging | Configured Spring Kafka to serialize and deserialize payment events as JSON. |
-| ⏳ Production Persistence | Idempotency storage is currently in-memory and should be replaced with Redis or a database. |
+| ✅ Payment Persistence | Payments are persisted using Spring Data JPA and PostgreSQL. |
+| ⏳ Production Idempotency Persistence | Idempotency storage is still in-memory and should be replaced with Redis or a database. |
 
 > **Learning Approach**
 >
@@ -139,6 +150,9 @@ The project was intentionally kept small so that each backend concept can be obs
 - Event-driven Payment Processing
 - Idempotency-Key Support
 - In-Memory Idempotency Store
+- PostgreSQL Payment Persistence
+- Spring Data JPA / Hibernate
+- `@Transactional` Payment Service
 - JSON Kafka Serialization
 - Constructor-based Dependency Injection
 - Docker Compose Kafka Environment
@@ -155,9 +169,11 @@ The project was intentionally kept small so that each backend concept can be obs
 | Kafka | Decouples payment submission from downstream payment processing. |
 | `PaymentCreatedEvent` | Creates an explicit event contract between the producer and consumer. |
 | Idempotency Key | Prevents the same client request from submitting the same payment repeatedly within the application's current runtime. |
-| `ConcurrentHashMap` | Provides a simple thread-safe in-memory implementation for the POC. |
+| PostgreSQL + JPA | Persists payment records beyond application restarts. |
+| `@Transactional` | Defines the database transaction boundary for payment persistence and idempotency-related database work. |
+| `ConcurrentHashMap` | Provides a simple thread-safe in-memory implementation for the current idempotency POC. |
 | Constructor Injection | Makes dependencies explicit and improves testability. |
-| Docker Compose | Provides a repeatable local Kafka development environment. |
+| Docker Compose | Provides a repeatable local Kafka and PostgreSQL development environment. |
 | JSON Serialization | Makes the Kafka event payload easy to inspect and integrate with other services. |
 
 ---
@@ -178,10 +194,15 @@ src/
     │       │
     │       ├── model/
     │       │   ├── Payment.java
-    │       │   └── PaymentCreatedEvent.java
+    │       │   ├── PaymentCreatedEvent.java
+    │       │   └── PaymentStatus.java
+    │       │
+    │       ├── repository/
+    │       │   └── PaymentRepository.java
     │       │
     │       └── service/
     │           ├── IdempotencyService.java
+    │           ├── PaymentService.java
     │           │
     │           ├── producer/
     │           │   └── PaymentProducer.java
@@ -196,16 +217,238 @@ docker-compose.yml
 pom.xml
 ```
 
-### Component Responsibilities
+### Package Responsibilities
 
-| Component | Responsibility |
-|-----------|----------------|
-| `PaymentController` | Receives payment requests, checks idempotency, creates the event, and publishes it. |
-| `PaymentProducer` | Sends `PaymentCreatedEvent` messages to Kafka. |
-| `PaymentConsumer` | Listens to `payment.created` and represents downstream payment processing. |
-| `IdempotencyService` | Tracks processed idempotency keys and their payment IDs. |
-| `Payment` | Represents the incoming payment request. |
-| `PaymentCreatedEvent` | Represents the event sent through Kafka. |
+| Package / Component | Responsibility |
+|---|---|
+| `controller` | Handles HTTP requests and delegates business operations to the service layer. |
+| `model` | Contains the JPA `Payment` entity, Kafka `PaymentCreatedEvent`, and `PaymentStatus` enum. |
+| `repository` | Provides Spring Data JPA persistence access for payments. |
+| `service` | Contains payment business logic, transaction boundaries, and idempotency handling. |
+| `service.producer` | Publishes payment events to Kafka. |
+| `service.consumer` | Consumes `PaymentCreatedEvent` messages from Kafka. |
+
+### Layered Request Flow
+
+```text
+Client
+  │
+  │ POST /payments
+  ▼
+PaymentController
+  │
+  │ createPayment()
+  ▼
+PaymentService
+  │
+  ├── Check Idempotency-Key
+  │
+  ├── Create PaymentCreatedEvent
+  │
+  ├── Save Payment ───────────────► PostgreSQL
+  │
+  ├── Save Idempotency Key
+  │
+  └── Publish Event ──────────────► Kafka
+                                      │
+                                      ▼
+                               PaymentConsumer
+                                      │
+                                      ▼
+                              Payment Processing
+```
+
+The controller is intentionally thin. Business logic is handled by `PaymentService`, while persistence and messaging are delegated to their respective components.
+
+### Why Introduce the Service Layer?
+
+The Service Layer was introduced primarily to establish a clear **transaction boundary** for the payment operation using Spring's `@Transactional`.
+
+The payment creation process consists of multiple steps that should be treated as one logical database transaction:
+
+```text
+PaymentController
+       │
+       ▼
+PaymentService.createPayment()
+       │
+       ├── Check Idempotency
+       │
+       ├── Save Payment
+       │
+       ├── Save Idempotency Record
+       │
+       └── Commit Transaction
+```
+
+By placing these operations inside a `@Transactional` service method, if an error occurs during the database operations **before the transaction is successfully completed**, Spring can roll back the database changes made within that transaction.
+
+For example:
+
+```text
+Start Transaction
+      │
+      ├── Save Payment              ✓
+      │
+      ├── Save Idempotency Record   ✗ ERROR
+      │
+      ▼
+Transaction Rollback
+      │
+      └── Payment save is rolled back
+```
+
+This prevents the database from being left in a partially completed state.
+
+The Service Layer therefore provides a natural place to:
+
+- Define the transaction boundary with `@Transactional`
+- Coordinate multiple database operations as one business operation
+- Roll back database changes when an operation fails
+- Keep transaction and business logic out of the HTTP controller
+- Make the business workflow easier to test and evolve
+
+> **Important:** `@Transactional` applies to the resources participating in the configured transaction, in this case the PostgreSQL database. It does **not** automatically roll back a Kafka message that has already been published. Coordinating PostgreSQL and Kafka atomically requires an approach such as Kafka transactions or, more commonly for this type of workflow, a **Transactional Outbox** pattern.
+
+---
+
+# Payment Controller and Service
+
+## `PaymentController`
+
+`PaymentController` is intentionally kept thin. It is responsible for accepting the HTTP request and delegating the operation to `PaymentService`.
+
+```java
+@RestController
+@RequestMapping("/payments")
+public class PaymentController {
+
+    private final PaymentService paymentService;
+
+    public PaymentController(PaymentService paymentService) {
+        this.paymentService = paymentService;
+    }
+
+    @PostMapping
+    public ResponseEntity<String> createPayment(
+            @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @RequestBody Payment payment) {
+
+        String result = paymentService.createPayment(
+                idempotencyKey,
+                payment
+        );
+
+        return ResponseEntity.ok(result);
+    }
+}
+```
+
+This keeps HTTP concerns out of the business/service layer.
+
+## `PaymentService`
+
+The payment workflow has been moved into `PaymentService`.
+
+```java
+@Service
+public class PaymentService {
+
+    private final PaymentProducer paymentProducer;
+    private final IdempotencyService idempotencyService;
+    private final PaymentRepository paymentRepository;
+
+    public PaymentService(
+            PaymentProducer paymentProducer,
+            IdempotencyService idempotencyService,
+            PaymentRepository paymentRepo) {
+
+        this.paymentProducer = paymentProducer;
+        this.idempotencyService = idempotencyService;
+        this.paymentRepository = paymentRepo;
+    }
+
+    @Transactional
+    public String createPayment(
+            String idempotencyKey,
+            Payment payment) {
+
+        if (idempotencyService.exists(idempotencyKey)) {
+            return "Payment already submitted: "
+                    + idempotencyService.getPaymentId(idempotencyKey);
+        }
+
+        PaymentCreatedEvent event =
+                new PaymentCreatedEvent(
+                        payment.getPaymentId(),
+                        payment.getCustomerId(),
+                        payment.getAmount(),
+                        payment.getCurrency()
+                );
+
+        // Persist payment
+        paymentRepository.save(payment);
+
+        // Save idempotency record
+        idempotencyService.save(
+                idempotencyKey,
+                payment.getPaymentId()
+        );
+
+        // Publish event
+        paymentProducer.publish(event);
+
+        return "Payment submitted: " + payment.getPaymentId();
+    }
+}
+```
+
+### Why `@Transactional`?
+
+`@Transactional` defines the database transaction boundary for the `createPayment()` operation.
+
+The main purpose is to ensure that the database changes made during the operation are treated as one logical unit of work. If an exception occurs before the transaction is successfully committed, Spring rolls back the database changes covered by the transaction rather than leaving the database partially updated.
+
+The intended database flow is:
+
+```text
+createPayment()
+      │
+      ▼
+Check Idempotency
+      │
+      ▼
+Save Payment
+      │
+      ▼
+Save Idempotency Record
+      │
+      ▼
+Commit Database Transaction
+```
+
+If a database operation fails and the exception causes the transaction to roll back, the payment persistence changes are not committed.
+
+**Important:** Spring's `@Transactional` does not automatically make PostgreSQL and Kafka one atomic transaction. Kafka publication is still a separate system operation in this implementation. The producer currently calls `KafkaTemplate.send()`, which is asynchronous.
+
+For a production-grade payment workflow, a **Transactional Outbox** pattern would be a natural next step:
+
+```text
+                PostgreSQL Transaction
+                       │
+             ┌─────────┴─────────┐
+             ▼                   ▼
+        Payment Table       Outbox Table
+                                 │
+                                 │
+                                 ▼
+                         Outbox Publisher
+                                 │
+                                 ▼
+                               Kafka
+```
+
+This avoids relying on a single local database transaction to atomically coordinate a database write and an external Kafka publish.
 
 ---
 
@@ -305,27 +548,29 @@ The payment submission follows this sequence:
       ▼
 2. PaymentController
       │
-      │ Check Idempotency-Key
+      │ delegates request
       ▼
-3. IdempotencyService
+3. PaymentService
       │
-      │ Key does not exist
-      ▼
-4. Create PaymentCreatedEvent
+      ├── Check Idempotency-Key
       │
-      ▼
-5. PaymentProducer
+      ├── Create PaymentCreatedEvent
       │
-      │ KafkaTemplate.send()
-      ▼
-6. Kafka
+      ├── Save Payment ───────► PostgreSQL
       │
-      │ payment.created
-      ▼
-7. PaymentConsumer
+      ├── Save Idempotency Key
       │
-      ▼
-8. Payment Processing
+      └── Publish Event
+                  │
+                  ▼
+             4. Kafka
+                  │
+                  │ payment.created
+                  ▼
+             5. PaymentConsumer
+                  │
+                  ▼
+             6. Payment Processing
 ```
 
 This demonstrates the basic separation between **request ingestion** and **asynchronous event processing**.
@@ -410,10 +655,18 @@ From the project root:
 docker compose up -d
 ```
 
-This starts the Apache Kafka broker on:
+This starts the Apache Kafka broker and PostgreSQL database.
+
+Kafka:
 
 ```text
 localhost:9092
+```
+
+PostgreSQL:
+
+```text
+localhost:5432
 ```
 
 Check the running containers:
@@ -506,6 +759,41 @@ Payment already submitted: PAY-10001
 ```
 
 This demonstrates the basic duplicate-request protection implemented by the POC.
+
+---
+
+# Payment Persistence
+
+The `Payment` model is now a JPA entity:
+
+```java
+@Entity
+@Table(name = "payments")
+public class Payment {
+
+    @Id
+    private String paymentId;
+
+    private String customerId;
+    private BigDecimal amount;
+    private String currency;
+}
+```
+
+`PaymentRepository` provides the Spring Data JPA repository used by `PaymentService`:
+
+```java
+@Repository
+public interface PaymentRepository
+        extends JpaRepository<Payment, UUID> {
+}
+```
+
+The application uses PostgreSQL as the relational database.
+
+The current payment flow therefore persists the payment before publishing the corresponding Kafka event.
+
+> **Implementation note:** The entity's `paymentId` is currently declared as `String`, while the repository in the supplied project declares `UUID` as its repository ID type. These types should be aligned before treating the repository as production-ready.
 
 ---
 
@@ -606,15 +894,16 @@ This is a learning-focused POC and does **not** yet implement several production
 
 ### Persistence
 
-- Idempotency is stored only in memory.
-- No payment database is currently implemented.
-- Payment status is not persisted.
+- Payments are persisted in PostgreSQL through Spring Data JPA.
+- Idempotency is still stored only in memory.
+- Payment status is currently represented by `PaymentStatus` but is not yet persisted as part of the payment lifecycle.
 
 ### Reliability
 
 - No retry strategy is implemented.
 - No dead-letter topic is configured.
 - No explicit Kafka error-handling strategy is implemented.
+- `@Transactional` protects the database transaction but does not make the PostgreSQL write and Kafka publication atomic.
 - No transactional outbox pattern is implemented.
 
 ### Security
@@ -651,7 +940,7 @@ The Kafka consumer currently logs the payment rather than integrating with a rea
 - Atomic duplicate-request handling
 - Concurrent request protection
 - Idempotency Client State Management
-- Idempotency Keys Clean Up and Retention Policies 
+- Idempotency Keys Clean Up and Retention Policies
 - Idempotency Retry Scenarios
 
 ### Kafka Reliability
@@ -870,7 +1159,8 @@ Recommended documentation:
 
 **ThessaCodes [Java]**
 
-**Project:** Demo Payment Service  
+**Project:** Demo Payment Service
+**Repository:** https://github.com/i-am-thessa/thessacodes-java-payment-service.git  
 **Created:** August 2026
 
 ---
