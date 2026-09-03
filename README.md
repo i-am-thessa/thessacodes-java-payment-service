@@ -386,7 +386,7 @@ public class PaymentService {
                         payment.getCurrency()
                 );
 
-        // Persist payment
+        // Persist payment - TODO not yet implemented
         paymentRepository.save(payment);
 
         // Save idempotency record
